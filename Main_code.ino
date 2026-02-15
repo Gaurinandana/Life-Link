@@ -1,18 +1,19 @@
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 #include <Adafruit_BMP280.h>
 #include <RTClib.h>
-TwoWire Wire(0);
 
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
+TwoWire Wire(0); // Hardware I2C on ARIES
+
 #define TOUCH_PIN 0
 #define BUZZER_PIN 1
 #define PRESSURE_THRESHOLD 2.0
 #define BT_NAME "LIFE-LINK_01"
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+// Timing Thresholds
+#define TRIGGER_HOLD_TIME 3000   
+#define PRESSURE_CONFIRM_TIME 2000 
+#define RESET_HOLD_TIME 5000     
+
 Adafruit_BMP280 bmp;
 RTC_DS3231 rtc;
 
@@ -20,106 +21,113 @@ float initialPressure;
 bool sosMode = false;
 DateTime startTime;
 uint32_t lastUpdate = 0;
+uint32_t touchStartTime = 0;
+uint32_t pressureStartTime = 0;
 
 void setup() {
-  Serial.begin(9600);   // Using only Serial (USB UART)
-
+  Serial.begin(9600); // Bluetooth and Serial Monitor output
   pinMode(TOUCH_PIN, INPUT);
   pinMode(BUZZER_PIN, OUTPUT);
 
   Wire.begin();
-
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
-    Serial.println("OLED Fail");
-
-  if (!bmp.begin(0x76))
-    Serial.println("BMP Fail");
-
-  if (!rtc.begin())
-    Serial.println("RTC Fail");
+  
+  if (!bmp.begin(0x76)) Serial.println("CRITICAL: BMP280 Not Found");
+  if (!rtc.begin()) Serial.println("CRITICAL: RTC Not Found");
 
   initialPressure = bmp.readPressure() / 100.0F;
 
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 10);
-  display.print("SYSTEM ARMED");
-  display.display();
+  Serial.println("--- LIFE-LINK BEACON INITIALIZED ---");
+  Serial.println("STATUS: MONITORING | MODE: ARMED");
 }
 
 void loop() {
   float currentPressure = bmp.readPressure() / 100.0F;
   bool isTouched = (digitalRead(TOUCH_PIN) == HIGH);
+  bool pressureAboveLimit = fabs(currentPressure - initialPressure) > PRESSURE_THRESHOLD;
 
-  if (!sosMode && (isTouched || fabs(currentPressure - initialPressure) > PRESSURE_THRESHOLD)) {
-    activateSOS();
+  // 1. TOUCH SENSOR LOGIC
+  if (isTouched) {
+    if (touchStartTime == 0) touchStartTime = millis();
+    uint32_t holdTime = millis() - touchStartTime;
+
+    if (!sosMode && holdTime >= TRIGGER_HOLD_TIME) {
+      activateSOS("MANUAL_PANIC_TRIGGER");
+      touchStartTime = 0;
+    } 
+    else if (sosMode && holdTime >= RESET_HOLD_TIME) {
+      deactivateSOS();
+      touchStartTime = 0;
+    }
+  } else {
+    touchStartTime = 0; 
   }
 
+  // 2. PRESSURE SENSOR LOGIC
+  if (!sosMode && pressureAboveLimit) {
+    if (pressureStartTime == 0) pressureStartTime = millis();
+    if (millis() - pressureStartTime >= PRESSURE_CONFIRM_TIME) {
+      activateSOS("LANDSLIDE_DETECTION");
+      pressureStartTime = 0;
+    }
+  } else {
+    pressureStartTime = 0;
+  }
+
+  // 3. LOGGING & SIGNALLING
   if (sosMode) {
     if (millis() - lastUpdate >= 1000) {
-      runSOSSequence();
+      broadcastData();
       lastUpdate = millis();
     }
   } else {
-    updateStandbyUI(currentPressure);
+    // Optional: Print status to monitor every 10 seconds to show it's alive
+    if (millis() - lastUpdate >= 10000) {
+      Serial.print("Monitoring... Current Pressure: ");
+      Serial.print(currentPressure);
+      Serial.println(" hPa");
+      lastUpdate = millis();
+    }
   }
 }
 
-void activateSOS() {
+void activateSOS(String reason) {
   sosMode = true;
   startTime = rtc.now();
-
-  Serial.print("\n>>> ALERT ACTIVATED: ");
-  Serial.println(BT_NAME);
+  Serial.println("\n*******************************");
+  Serial.print("!!! SOS ACTIVATED BY: "); Serial.println(reason);
+  Serial.print("INCIDENT START TIME: "); 
+  Serial.print(startTime.year()); Serial.print("/"); 
+  Serial.print(startTime.month()); Serial.print("/"); 
+  Serial.println(startTime.day());
+  Serial.print("EXACT TIME: ");
+  Serial.print(startTime.hour()); Serial.print(":"); 
+  Serial.print(startTime.minute()); Serial.print(":"); 
+  Serial.println(startTime.second());
+  Serial.println("*******************************\n");
 }
 
-void runSOSSequence() {
+void deactivateSOS() {
+  sosMode = false;
+  digitalWrite(BUZZER_PIN, LOW);
+  Serial.println("\n>>> RESCUE CONFIRMED. SYSTEM RESET TO MONITORING MODE. <<<\n");
+  initialPressure = bmp.readPressure() / 100.0F; // Recalibrate
+}
+
+void broadcastData() {
   DateTime now = rtc.now();
   TimeSpan elapsed = now - startTime;
 
-  // Send data via Serial (Bluetooth must share this line)
-  Serial.print("ID:");
-  Serial.print(BT_NAME);
-  Serial.print("|ELAPSED:");
-  Serial.println(elapsed.totalseconds());
+  // This goes to both your PC and the Rescuer's Phone via Bluetooth
+  Serial.print("[BEACON_ID: "); Serial.print(BT_NAME); Serial.print("] ");
+  Serial.print("| STATUS: TRAPPED | ");
+  Serial.print("DURATION: ");
+  Serial.print(elapsed.hours()); Serial.print("h ");
+  Serial.print(elapsed.minutes()); Serial.print("m ");
+  Serial.print(elapsed.seconds()); Serial.print("s | ");
+  Serial.print("RTC_NOW: "); Serial.print(now.hour()); Serial.print(":"); Serial.println(now.minute());
 
-  // Buzzer Pulse
+  // Buzzer Pulse for location tracking
   digitalWrite(BUZZER_PIN, HIGH);
   delay(100);
   digitalWrite(BUZZER_PIN, LOW);
-
-  // OLED Update
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.print("SIGNAL: ");
-  display.print(BT_NAME);
-
-  display.setTextSize(2);
-  display.setCursor(10, 20);
-  display.print("EMERGENCY");
-
-  display.setTextSize(1);
-  display.setCursor(0, 45);
-  display.print("Time: ");
-  display.print(elapsed.hours()); display.print("h ");
-  display.print(elapsed.minutes()); display.print("m ");
-  display.print(elapsed.seconds()); display.print("s");
-
-  display.display();
-}
-
-void updateStandbyUI(float p) {
-  if (millis() - lastUpdate >= 5000) {
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.print("MONITORING...");
-    display.setCursor(0, 25);
-    display.print("P: ");
-    display.print(p, 1);
-    display.print(" hPa");
-    display.display();
-
-    lastUpdate = millis();
-  }
 }
